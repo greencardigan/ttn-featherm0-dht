@@ -1,31 +1,47 @@
 /*******************************************************************************
  * The Things Network - Sensor Data Example
- * 
+ *
  * Example of sending a valid LoRaWAN packet with DHT22 temperature and
  * humidity data to The Things Networ using a Feather M0 LoRa.
- * 
+ *
  * Learn Guide: https://learn.adafruit.com/the-things-network-for-feather
- * 
+ *
  * Copyright (c) 2015 Thomas Telkamp and Matthijs Kooijman
  * Copyright (c) 2018 Terry Moore, MCCI
  * Copyright (c) 2018 Brent Rubell, Adafruit Industries
- * 
+ *
  * Permission is hereby granted, free of charge, to anyone
  * obtaining a copy of this document and accompanying files,
  * to do whatever they want with them without any restriction,
  * including, but not limited to, copying, modification and redistribution.
  * NO WARRANTY OF ANY KIND IS PROVIDED.
  *******************************************************************************/
+
 #include <lmic.h>
 #include <hal/hal.h>
 #include <SPI.h>
+#include <CayenneLPP.h>
 
 // include the DHT22 Sensor Library
 #include "DHT.h"
 
+// Include library to decode CayenneLPP downlinks
+#include "LPPDecode.h"
+
+
 // DHT digital pin and sensor type
 #define DHTPIN 10
 #define DHTTYPE DHT22
+
+int led = 13;
+int ledValue = 255;
+
+#define VBATPIN A7
+
+#define ECHOPIN 12 // Pin to receive echo pulse
+#define TRIGPIN 11 // Pin to send trigger pulse
+
+CayenneLPP lpp(51);
 
 // This EUI must be in little-endian format, so least-significant-byte
 // first. When copying an EUI from ttnctl output, this means to reverse
@@ -45,12 +61,12 @@ static const u1_t PROGMEM APPKEY[16] = { FILLMEIN };
 void os_getDevKey (u1_t* buf) {  memcpy_P(buf, APPKEY, 16);}
 
 // payload to send to TTN gateway
-static uint8_t payload[5];
+///////////static uint8_t payload[7];
 static osjob_t sendjob;
 
 // Schedule TX every this many seconds (might become longer due to duty
 // cycle limitations).
-const unsigned TX_INTERVAL = 30;
+const unsigned TX_INTERVAL = 300;
 
 // Pin mapping for Adafruit Feather M0 LoRa
 const lmic_pinmap lmic_pins = {
@@ -98,14 +114,14 @@ void onEvent (ev_t ev) {
               Serial.print("devaddr: ");
               Serial.println(devaddr, HEX);
               Serial.print("artKey: ");
-              for (int i=0; i<sizeof(artKey); ++i) {
+              for (size_t i=0; i<sizeof(artKey); ++i) {
                 if (i != 0)
                   Serial.print("-");
                 Serial.print(artKey[i], HEX);
               }
               Serial.println("");
               Serial.print("nwkKey: ");
-              for (int i=0; i<sizeof(nwkKey); ++i) {
+              for (size_t i=0; i<sizeof(nwkKey); ++i) {
                       if (i != 0)
                               Serial.print("-");
                       Serial.print(nwkKey[i], HEX);
@@ -132,15 +148,25 @@ void onEvent (ev_t ev) {
             Serial.println(F("EV_REJOIN_FAILED"));
             break;
             break;
-        case EV_TXCOMPLETE:            
+        case EV_TXCOMPLETE:
             Serial.println(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
-            digitalWrite(LED_BUILTIN, LOW);
             if (LMIC.txrxFlags & TXRX_ACK)
               Serial.println(F("Received ack"));
             if (LMIC.dataLen) {
               Serial.println(F("Received "));
               Serial.println(LMIC.dataLen);
               Serial.println(F(" bytes of payload"));
+
+              if (LMIC.dataLen == 4) {
+                float ValueReturn;
+                if (LPP_Analog(4, ValueReturn)){
+                  Serial.print("Value returned for channel 4: ");
+                  Serial.println(ValueReturn);
+                  ledValue = ValueReturn;
+                  analogWrite(led, ledValue);
+                }
+              }
+
             }
             // Schedule next transmission
             os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
@@ -171,7 +197,6 @@ void onEvent (ev_t ev) {
         */
         case EV_TXSTART:
             Serial.println(F("EV_TXSTART"));
-            digitalWrite(LED_BUILTIN, HIGH);
             break;
         default:
             Serial.print(F("Unknown event: "));
@@ -190,56 +215,80 @@ void do_send(osjob_t* j){
         Serial.print("Temperature: "); Serial.print(temperature);
         Serial.println(" *C");
         // adjust for the f2sflt16 range (-1 to 1)
-        temperature = temperature / 100; 
+        //////temperature = temperature / 100;
 
         // read the humidity from the DHT22
         float rHumidity = dht.readHumidity();
         Serial.print("%RH ");
         Serial.println(rHumidity);
         // adjust for the f2sflt16 range (-1 to 1)
-        rHumidity = rHumidity / 100;
+        //////rHumidity = rHumidity / 100;
+
+        // read the battery voltage on D9 (a.k.a analog #7 A7)
+        float measuredvbat = analogRead(VBATPIN);
+        measuredvbat *= 2;    // we divided by 2, so multiply back
+        measuredvbat *= 3.3;  // Multiply by 3.3V, our reference voltage
+        measuredvbat /= 1024; // convert to voltage
+        Serial.print("VBat: " );
+        Serial.println(measuredvbat);
+        //////measuredvbat = measuredvbat / 100;
+
+        // Get distance data from Ultrasonic sensor
+        digitalWrite(TRIGPIN, LOW); // Set the trigger pin to low for 2uS
+        delayMicroseconds(2);
+        digitalWrite(TRIGPIN, HIGH); // Send a 10uS high to trigger ranging
+        delayMicroseconds(20);
+        digitalWrite(TRIGPIN, LOW); // Send pin low again
+        int distance = pulseIn(ECHOPIN, HIGH,26000); // Read in times pulse
+        distance = distance / 58;
+        Serial.print(distance);
+        Serial.println(" cm");
+
+        lpp.reset();
+
+        // Add cayenne sensor data
+        lpp.addTemperature(0, temperature);
+        lpp.addRelativeHumidity(1, rHumidity);
+        lpp.addAnalogInput(2, measuredvbat);
+        if (distance > 0) lpp.addAnalogInput(3, distance);
+
+        // Request Cayenne downlinks
+        lpp.addAnalogOutput(4, ledValue); // channel 4, set analog output to ledValue
         
-        // float -> int
-        // note: this uses the sflt16 datum (https://github.com/mcci-catena/arduino-lmic#sflt16)
-        uint16_t payloadTemp = LMIC_f2sflt16(temperature);
-        // int -> bytes
-        byte tempLow = lowByte(payloadTemp);
-        byte tempHigh = highByte(payloadTemp);
-        // place the bytes into the payload
-        payload[0] = tempLow;
-        payload[1] = tempHigh;
-
-        // float -> int
-        uint16_t payloadHumid = LMIC_f2sflt16(rHumidity);
-        // int -> bytes
-        byte humidLow = lowByte(payloadHumid);
-        byte humidHigh = highByte(payloadHumid);
-        payload[2] = humidLow;
-        payload[3] = humidHigh;
-
         // prepare upstream data transmission at the next possible time.
         // transmit on port 1 (the first parameter); you can use any value from 1 to 223 (others are reserved).
         // don't request an ack (the last parameter, if not zero, requests an ack from the network).
         // Remember, acks consume a lot of network resources; don't ask for an ack unless you really need it.
-        LMIC_setTxData2(1, payload, sizeof(payload)-1, 0);
+        LMIC_setTxData2(1, lpp.getBuffer(), lpp.getSize(), 0);
+        Serial.println(F("Packet queued"));
     }
     // Next TX is scheduled after TX_COMPLETE event.
 }
 
 void setup() {
     delay(5000);
-    while (! Serial);
+    //while (! Serial);
     Serial.begin(9600);
+    Serial.println("Cayenne1");
     Serial.println(F("Starting"));
-    
-    pinMode(LED_BUILTIN, OUTPUT);
-    // dht init.
+   
+
     dht.begin();
 
-    // LMIC init.
+    pinMode(13, OUTPUT);
+
+    // setup ultrasonic module pins
+    pinMode(ECHOPIN, INPUT);
+    pinMode(TRIGPIN, OUTPUT);
+    digitalWrite(ECHOPIN, HIGH);
+
+    // LMIC init
     os_init();
     // Reset the MAC state. Session and pending data transfers will be discarded.
     LMIC_reset();
+    
+    //LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
+    
     // Disable link-check mode and ADR, because ADR tends to complicate testing.
     LMIC_setLinkCheckMode(0);
     // Set the data rate to Spreading Factor 7.  This is the fastest supported rate for 125 kHz channels, and it
@@ -248,7 +297,7 @@ void setup() {
     // in the US, with TTN, it saves join time if we start on subband 1 (channels 8-15). This will
     // get overridden after the join by parameters from the network. If working with other
     // networks or in other regions, this will need to be changed.
-    LMIC_selectSubBand(1);
+    //LMIC_selectSubBand(1);
 
     // Start job (sending automatically starts OTAA too)
     do_send(&sendjob);
